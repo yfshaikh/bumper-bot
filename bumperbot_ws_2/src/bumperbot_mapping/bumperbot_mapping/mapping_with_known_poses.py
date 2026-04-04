@@ -9,36 +9,46 @@ from tf2_ros import LookupException
 from tf_transformations import euler_from_quaternion
 import math
 
-PRIOR_PROB = 0.5
-OCC_PROB = 0.9
-FREE_PROB = 0.35
+
+PRIOR_PROB = 0.5 # probability of a cell being occupied (could be occupied or free)
+OCC_PROB = 0.9 # when we see an obstacle, we are very confident that the cell is occupied
+FREE_PROB = 0.35 # when we do not see an obstacle, we are not fully confident that the cell is free, so we still assign it a 35% probability of being occupied
 
 class Pose:
     def __init__(self, px=0, py=0):
         self.x = px
         self.y = py
 
+# convert a probability to a log-odds value
 def prob2logodds(p):
     return math.log(p / (1 - p))
 
+# convert a log-odds value to a probability
 def logodds2prob(l):
     try:
         return 1 - (1 / (1 + math.exp(l)))
     except OverflowError:
         return 1.0 if l > 0 else 0.0
 
+# convert a pose on the map to a cell index (the map is stored as a 1D array, so we need to convert the 2D pose to a 1D index)
 def poseToCell(pose: Pose, map_info: MapMetaData):
     return map_info.width * pose.y + pose.x
 
+
+# convert cartesian coordinates to a pose on the map
 def coordinatesToPose(px, py, map_info: MapMetaData):
     pose = Pose()
     pose.x = round((px - map_info.origin.position.x) / map_info.resolution)
     pose.y = round((py - map_info.origin.position.y) / map_info.resolution)
     return pose
 
+# check if a pose is on the map
 def poseOnMap(pose: Pose, map_info: MapMetaData):
     return pose.x < map_info.width and pose.x >= 0 and pose.y < map_info.height and pose.y >= 0
 
+# Bresenham's line drawing algorithm
+# https://en.wikipedia.org/wiki/Bresenham's_line_algorithm
+# returns a list of poses along the line from start to end
 def bresenham(start: Pose, end: Pose):
     line = []
 
@@ -78,18 +88,24 @@ def bresenham(start: Pose, end: Pose):
     return line
 
 def inverseSensorModel(p_robot: Pose, p_beam: Pose):
-    occ_values = []
+    # return a list of tuples, each containing a pose and an occupancy value
+    # the occupancy value is the probability of the cell being occupied
+    # the pose is the cell in the map that is being marked
+    occupancy_values = []
     line = bresenham(p_robot, p_beam)
 
+    # mark all cells along the line as free
     for pose in line[:-1]:
-        occ_values.append((pose, FREE_PROB))  # FREE
+        occupancy_values.append((pose, FREE_PROB))  # FREE
 
-    occ_values.append((line[-1], OCC_PROB))  # OCCUPIED
-    return occ_values
+    # mark the end of the line as occupied
+    occupancy_values.append((line[-1], OCC_PROB))  # OCCUPIED
+    return occupancy_values
 
 class MappingWithKnownPoses(Node):
     def __init__(self, name):
         super().__init__(name)
+        # declare the width, height and resolution of the map as parameters
         self.declare_parameter("width", 50.0)
         self.declare_parameter("height", 50.0)
         self.declare_parameter("resolution", 0.1)
@@ -98,6 +114,7 @@ class MappingWithKnownPoses(Node):
         height = self.get_parameter("height").value
         resolution = self.get_parameter("resolution").value
 
+        # initialize the map with the width, height and resolution
         self.map_ = OccupancyGrid()
         self.map_.info.resolution = resolution
         self.map_.info.width = round(width / resolution)
@@ -106,6 +123,9 @@ class MappingWithKnownPoses(Node):
         self.map_.info.origin.position.y = float(-round(height / 2.0))
         self.map_.header.frame_id = "odom"
         self.map_.data = [-1] * (self.map_.info.width * self.map_.info.height)
+
+        # probabilistic grid
+        # store probability values as log-odds
         self.probability_map_ = [prob2logodds(PRIOR_PROB)] * (self.map_.info.width * self.map_.info.height)
 
         self.tf_buffer = Buffer()
@@ -116,6 +136,7 @@ class MappingWithKnownPoses(Node):
 
     def scanCallback(self, scan: LaserScan):
         try:
+            # lookup the transform from the map frame to the robot frame
             t = self.tf_buffer.lookup_transform(self.map_.header.frame_id, scan.header.frame_id, rclpy.time.Time())
         except LookupException:
             self.get_logger().error("Unable to transform between /odom and /base_footprint")
@@ -126,17 +147,26 @@ class MappingWithKnownPoses(Node):
             self.get_logger().error("The robot is out of the map!")
             return
 
+        # calculate the transform from the robot frame from which the scan is taken to the map frame
+        # we already have the transform in the t variable, but we need to convert it to euler angles
+        # we only care about the yaw angle
         (roll, pitch, yaw) = euler_from_quaternion(
             [t.transform.rotation.x, t.transform.rotation.y,
              t.transform.rotation.z, t.transform.rotation.w])
         
+        # iterate over the ranges of the scan
         for i in range(len(scan.ranges)):
+            # skip if the range is infinite (invalid reading)
             if math.isinf(scan.ranges[i]):
                 continue
-            # Polar to cartesian conversion
+            # each range[i] is the distance to the obstacle
+            # each scan incremenents the angle by scan.angle_increment, so the i-th angle is scan.angle_min + (i * scan.angle_increment)
+            # we need to add the yaw angle to the angle to get the angle in the map frame
             angle = scan.angle_min + (i * scan.angle_increment) + yaw
+            # convert the angle to cartesian coordinates
             px = scan.ranges[i] * math.cos(angle)
             py = scan.ranges[i] * math.sin(angle)
+            # add the translation of the robot to the cartesian coordinates (converting to odom frame)
             px += t.transform.translation.x
             py += t.transform.translation.y
 
@@ -149,9 +179,11 @@ class MappingWithKnownPoses(Node):
             for pose, value in poses:
                 if poseOnMap(pose, self.map_.info):
                     cell = poseToCell(pose, self.map_.info)
+                    # update the probability of the cell based on the occupancy value (refer to equation)
                     self.probability_map_[cell] += prob2logodds(value) - prob2logodds(PRIOR_PROB)
 
     def timerCallback(self):
+        # convert the log-odds values to probabilities and scale to 0-100, then store in the map data
         self.map_.data = [int(logodds2prob(value) * 100) for value in self.probability_map_]
         self.map_.header.stamp = self.get_clock().now().to_msg()
         self.map_pub.publish(self.map_)
